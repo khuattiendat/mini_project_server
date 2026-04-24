@@ -26,7 +26,7 @@ This project uses **TypeORM** for seamless database schema management.
 **Auto-generate migration from entity changes:**
 
 ```bash
-yarn typeorm -- migration:generate src/database/migrations/[name]
+yarn typeorm migration:generate src/database/migrations/[name]
 ```
 
 > This compares your entities with the current database schema and creates the necessary changes.

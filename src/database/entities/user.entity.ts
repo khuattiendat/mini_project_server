@@ -2,6 +2,7 @@ import { BaseEntity } from 'src/common/base/base.entity';
 import { Column, Entity, Index, OneToMany } from 'typeorm';
 import { ExamAttempt } from './examAttempt.entity';
 import { UserLog } from './userLog.entity';
+import { RefreshToken } from './refresh-token.entity';
 
 export enum UserRole {
   ADMIN = 'admin',
@@ -64,4 +65,7 @@ export class User extends BaseEntity {
 
   @OneToMany(() => UserLog, (userLog) => userLog.user)
   userLogs!: UserLog[];
+
+  @OneToMany(() => RefreshToken, (refreshToken) => refreshToken.user)
+  refreshTokens!: RefreshToken[];
 }
