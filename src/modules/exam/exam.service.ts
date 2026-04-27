@@ -1,18 +1,21 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Exam } from 'src/database/entities/exam.entity';
 import { ExamAttempt } from 'src/database/entities/examAttempt.entity';
 import { Question } from 'src/database/entities/question.entity';
 import { User } from 'src/database/entities/user.entity';
 import { Violation } from 'src/database/entities/violation.entity';
-import { In, Repository } from 'typeorm';
+import { DataSource, In, Repository } from 'typeorm';
 import { CreateExamDto } from './dto/create-exam.dto';
 import { ExamQueryDto } from './dto/exam-query.dto';
 import { UpdateExamDto } from './dto/update-exam.dto';
 
 @Injectable()
 export class ExamService {
+  private readonly logger = new Logger(ExamService.name);
+
   constructor(
+    private readonly dataSource: DataSource,
     @InjectRepository(Exam)
     private readonly examRepository: Repository<Exam>,
     @InjectRepository(ExamAttempt)
@@ -23,7 +26,9 @@ export class ExamService {
     private readonly userRepository: Repository<User>,
     @InjectRepository(Violation)
     private readonly violationRepository: Repository<Violation>,
-  ) {}
+  ) { }
+
+  // ─── Dashboard ────────────────────────────────────────────────────────────
 
   async getDashboardStats() {
     const [
@@ -37,76 +42,19 @@ export class ExamService {
       totalViolations,
       violationsByType,
     ] = await Promise.all([
-      // Overview counts
       this.userRepository.count({ where: { deletedAt: null as any } }),
       this.examRepository.count({ where: { deletedAt: null as any } }),
       this.questionRepository.count({ where: { deletedAt: null as any } }),
       this.attemptRepository.count(),
-
-      // Attempts by status
-      this.attemptRepository
-        .createQueryBuilder('a')
-        .select('a.status', 'status')
-        .addSelect('COUNT(*)', 'count')
-        .groupBy('a.status')
-        .getRawMany<{ status: string; count: string }>(),
-
-      // Top 5 exams by attempt count
-      this.attemptRepository
-        .createQueryBuilder('a')
-        .leftJoin('a.exam', 'exam')
-        .select('a.examId', 'examId')
-        .addSelect('exam.title', 'examTitle')
-        .addSelect('COUNT(*)', 'attemptCount')
-        .where('exam.deletedAt IS NULL')
-        .groupBy('a.examId')
-        .addGroupBy('exam.title')
-        .orderBy('attemptCount', 'DESC')
-        .limit(5)
-        .getRawMany<{ examId: string; examTitle: string; attemptCount: string }>(),
-
-      // Attempts per day — last 14 days
-      this.attemptRepository
-        .createQueryBuilder('a')
-        .select("DATE_FORMAT(a.createdAt, '%Y-%m-%d')", 'date')
-        .addSelect('COUNT(*)', 'count')
-        .where('a.createdAt >= :from', {
-          from: new Date(Date.now() - 13 * 24 * 60 * 60 * 1000),
-        })
-        .groupBy('date')
-        .orderBy('date', 'ASC')
-        .getRawMany<{ date: string; count: string }>(),
-
-      // Violations total
+      this.getAttemptsByStatus(),
+      this.getTopExams(),
+      this.getAttemptsTimeline(),
       this.violationRepository.count(),
-
-      // Violations by type
-      this.violationRepository
-        .createQueryBuilder('v')
-        .select('v.type', 'type')
-        .addSelect('COUNT(*)', 'count')
-        .groupBy('v.type')
-        .orderBy('count', 'DESC')
-        .limit(6)
-        .getRawMany<{ type: string; count: string }>(),
+      this.getViolationsByType(),
     ]);
 
-    // Fill missing days in timeline
-    const timelineMap = new Map(timelineRaw.map((r) => [r.date, Number(r.count)]));
-    const timeline: Array<{ date: string; count: number }> = [];
-    for (let i = 13; i >= 0; i--) {
-      const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000);
-      const key = d.toISOString().slice(0, 10);
-      timeline.push({ date: key, count: timelineMap.get(key) ?? 0 });
-    }
-
     return {
-      overview: {
-        totalUsers,
-        totalExams,
-        totalQuestions,
-        totalAttempts,
-      },
+      overview: { totalUsers, totalExams, totalQuestions, totalAttempts },
       attemptsByStatus: attemptsByStatus.map((r) => ({
         status: r.status,
         count: Number(r.count),
@@ -116,7 +64,7 @@ export class ExamService {
         examTitle: r.examTitle,
         attemptCount: Number(r.attemptCount),
       })),
-      attemptsTimeline: timeline,
+      attemptsTimeline: this.fillTimelineGaps(timelineRaw),
       violations: {
         totalViolations,
         byType: violationsByType.map((r) => ({
@@ -127,19 +75,15 @@ export class ExamService {
     };
   }
 
-  async getAvailableExams(userId: number) {
-    const now = new Date();
+  // ─── Public / User-facing ─────────────────────────────────────────────────
 
-    // Get public exams + exams assigned to this user, both with startDate <= now
+  async getAvailableExams(userId: number) {
     const exams = await this.examRepository
       .createQueryBuilder('exam')
       .leftJoin('exam.assignedUsers', 'assignedUser')
       .where('exam.deletedAt IS NULL')
-      .andWhere('exam.startDate <= :now', { now })
-      .andWhere(
-        '(exam.isPublic = true OR assignedUser.id = :userId)',
-        { userId },
-      )
+      .andWhere('exam.startDate <= :now', { now: new Date() })
+      .andWhere('(exam.isPublic = true OR assignedUser.id = :userId)', { userId })
       .orderBy('exam.startDate', 'DESC')
       .getMany();
 
@@ -168,18 +112,20 @@ export class ExamService {
     }));
   }
 
-  async create(createExamDto: CreateExamDto) {
+  // ─── CRUD ─────────────────────────────────────────────────────────────────
+
+  async create(dto: CreateExamDto) {
     const exam = this.examRepository.create({
-      title: createExamDto.title,
-      description: createExamDto.description?.trim() || null,
-      duration: createExamDto.duration,
-      startDate: createExamDto.startDate,
-      isPublic: createExamDto.isPublic ?? false,
+      title: dto.title,
+      description: dto.description?.trim() || null,
+      duration: dto.duration,
+      startDate: dto.startDate,
+      isPublic: dto.isPublic ?? false,
     });
 
-    const savedExam = await this.examRepository.save(exam);
-
-    return this.toResponse(savedExam);
+    const saved = await this.examRepository.save(exam);
+    this.logger.log(`Exam created: id=${saved.id}`);
+    return this.toResponse(saved);
   }
 
   async findAll(query: ExamQueryDto) {
@@ -187,16 +133,14 @@ export class ExamService {
     const limit = query.limit ?? 10;
     const search = query.search?.trim();
 
-    const qb = this.examRepository.createQueryBuilder('exam');
-
-    qb.andWhere('exam.deletedAt IS NULL');
+    const qb = this.examRepository
+      .createQueryBuilder('exam')
+      .where('exam.deletedAt IS NULL');
 
     if (search) {
-      const searchTerm = `%${search}%`;
-
       qb.andWhere(
-        '(exam.title LIKE :searchTerm OR exam.description LIKE :searchTerm OR CAST(exam.id AS CHAR) LIKE :searchTerm)',
-        { searchTerm },
+        '(exam.title LIKE :s OR exam.description LIKE :s OR CAST(exam.id AS CHAR) LIKE :s)',
+        { s: `%${search}%` },
       );
     }
 
@@ -207,61 +151,51 @@ export class ExamService {
       .getManyAndCount();
 
     return {
-      items: items.map((exam) => this.toResponse(exam)),
-      meta: {
-        page,
-        limit,
-        totalItems,
-        totalPages: Math.ceil(totalItems / limit),
-        hasNextPage: page * limit < totalItems,
-        hasPreviousPage: page > 1,
-      },
+      items: items.map((e) => this.toResponse(e)),
+      meta: this.buildMeta(page, limit, totalItems),
     };
   }
 
   async findOne(id: number) {
-    const exam = await this.findExamOrThrow(id);
-
-    return this.toResponse(exam);
+    return this.toResponse(await this.findExamOrThrow(id));
   }
 
-  async update(id: number, updateExamDto: UpdateExamDto) {
+  async update(id: number, dto: UpdateExamDto) {
     const exam = await this.findExamOrThrow(id);
 
-    if (updateExamDto.title !== undefined) {
-      exam.title = updateExamDto.title;
-    }
+    if (dto.title !== undefined) exam.title = dto.title;
+    if (dto.description !== undefined) exam.description = dto.description?.trim() || null;
+    if (dto.duration !== undefined) exam.duration = dto.duration;
+    if (dto.startDate !== undefined) exam.startDate = dto.startDate;
+    if (dto.isPublic !== undefined) exam.isPublic = dto.isPublic;
 
-    if (updateExamDto.description !== undefined) {
-      exam.description = updateExamDto.description?.trim() || null;
-    }
-
-    if (updateExamDto.duration !== undefined) {
-      exam.duration = updateExamDto.duration;
-    }
-
-    if (updateExamDto.startDate !== undefined) {
-      exam.startDate = updateExamDto.startDate;
-    }
-
-    if (updateExamDto.isPublic !== undefined) {
-      exam.isPublic = updateExamDto.isPublic;
-    }
-
-    const savedExam = await this.examRepository.save(exam);
-
-    return this.toResponse(savedExam);
+    const saved = await this.examRepository.save(exam);
+    this.logger.log(`Exam updated: id=${id}`);
+    return this.toResponse(saved);
   }
 
   async remove(id: number) {
     await this.findExamOrThrow(id);
 
-    await this.examRepository.softDelete(id);
+    await this.dataSource.transaction(async (manager) => {
+      const examRepo = manager.getRepository(Exam);
 
-    return {
-      message: 'Exam deleted successfully',
-    };
+      // Clear ManyToMany junction (exam_user_assignments) — no DB cascade on this
+      const exam = await examRepo.findOne({ where: { id }, relations: ['assignedUsers'] });
+      if (exam) {
+        exam.assignedUsers = [];
+        await examRepo.save(exam);
+      }
+
+      // Hard delete — triggers ON DELETE CASCADE for questions, attempts, violations
+      await examRepo.delete(id);
+    });
+
+    this.logger.log(`Exam deleted: id=${id}`);
+    return { message: 'Exam deleted successfully' };
   }
+
+  // ─── User Assignment ──────────────────────────────────────────────────────
 
   async getAssignedUsers(examId: number) {
     const exam = await this.examRepository.findOne({
@@ -269,11 +203,9 @@ export class ExamService {
       relations: ['assignedUsers'],
     });
 
-    if (!exam) {
-      throw new NotFoundException(`Exam with id ${examId} not found`);
-    }
+    if (!exam) throw new NotFoundException(`Exam with id ${examId} not found`);
 
-    return (exam.assignedUsers ?? []).map((u) => ({
+    return exam.assignedUsers.map((u) => ({
       id: u.id,
       userName: u.userName,
       fullName: u.fullName,
@@ -282,57 +214,61 @@ export class ExamService {
   }
 
   async assignUsers(examId: number, userIds: number[]) {
-    const exam = await this.examRepository.findOne({
-      where: { id: examId },
-      relations: ['assignedUsers'],
-    });
-
-    if (!exam) {
-      throw new NotFoundException(`Exam with id ${examId} not found`);
-    }
-
-    const users = await this.userRepository.find({
-      where: { id: In(userIds) },
-    });
+    const users = await this.userRepository.find({ where: { id: In(userIds) } });
 
     if (users.length !== userIds.length) {
       throw new NotFoundException('One or more users not found');
     }
 
-    const existingIds = new Set((exam.assignedUsers ?? []).map((u) => u.id));
-    const newUsers = users.filter((u) => !existingIds.has(u.id));
-    exam.assignedUsers = [...(exam.assignedUsers ?? []), ...newUsers];
-    await this.examRepository.save(exam);
+    await this.dataSource.transaction(async (manager) => {
+      const examRepo = manager.getRepository(Exam);
 
+      const exam = await examRepo.findOne({ where: { id: examId }, relations: ['assignedUsers'] });
+      if (!exam) throw new NotFoundException(`Exam with id ${examId} not found`);
+
+      const existingIds = new Set(exam.assignedUsers.map((u) => u.id));
+      const newUsers = users.filter((u) => !existingIds.has(u.id));
+      exam.assignedUsers = [...exam.assignedUsers, ...newUsers];
+
+      await examRepo.save(exam);
+    });
+
+    this.logger.log(`Assigned ${users.length} users to exam id=${examId}`);
     return { message: 'Users assigned successfully', count: users.length };
   }
 
   async unassignUser(examId: number, userId: number) {
-    const exam = await this.examRepository.findOne({
-      where: { id: examId },
-      relations: ['assignedUsers'],
+    await this.dataSource.transaction(async (manager) => {
+      const examRepo = manager.getRepository(Exam);
+
+      const exam = await examRepo.findOne({ where: { id: examId }, relations: ['assignedUsers'] });
+      if (!exam) throw new NotFoundException(`Exam with id ${examId} not found`);
+
+      exam.assignedUsers = exam.assignedUsers.filter((u) => u.id !== userId);
+      await examRepo.save(exam);
     });
 
-    if (!exam) {
-      throw new NotFoundException(`Exam with id ${examId} not found`);
-    }
-
-    exam.assignedUsers = (exam.assignedUsers ?? []).filter(
-      (u) => u.id !== userId,
-    );
-    await this.examRepository.save(exam);
-
+    this.logger.log(`Unassigned user id=${userId} from exam id=${examId}`);
     return { message: 'User unassigned successfully' };
   }
 
+  // ─── Private helpers ──────────────────────────────────────────────────────
+
   private async findExamOrThrow(id: number): Promise<Exam> {
     const exam = await this.examRepository.findOne({ where: { id } });
-
-    if (!exam) {
-      throw new NotFoundException(`Exam with id ${id} not found`);
-    }
-
+    if (!exam) throw new NotFoundException(`Exam with id ${id} not found`);
     return exam;
+  }
+
+  private buildMeta(page: number, limit: number, totalItems: number) {
+    return {
+      page,
+      limit,
+      totalItems,
+      totalPages: Math.ceil(totalItems / limit),
+      hasNextPage: page * limit < totalItems,
+      hasPreviousPage: page > 1,
+    };
   }
 
   private toResponse(exam: Exam) {
@@ -347,5 +283,64 @@ export class ExamService {
       updatedAt: exam.updatedAt,
       deletedAt: exam.deletedAt,
     };
+  }
+
+  // ─── Dashboard query helpers ──────────────────────────────────────────────
+
+  private getAttemptsByStatus() {
+    return this.attemptRepository
+      .createQueryBuilder('a')
+      .select('a.status', 'status')
+      .addSelect('COUNT(*)', 'count')
+      .groupBy('a.status')
+      .getRawMany<{ status: string; count: string }>();
+  }
+
+  private getTopExams() {
+    return this.attemptRepository
+      .createQueryBuilder('a')
+      .leftJoin('a.exam', 'exam')
+      .select('a.examId', 'examId')
+      .addSelect('exam.title', 'examTitle')
+      .addSelect('COUNT(*)', 'attemptCount')
+      .where('exam.deletedAt IS NULL')
+      .groupBy('a.examId')
+      .addGroupBy('exam.title')
+      .orderBy('attemptCount', 'DESC')
+      .limit(5)
+      .getRawMany<{ examId: string; examTitle: string; attemptCount: string }>();
+  }
+
+  private getAttemptsTimeline() {
+    return this.attemptRepository
+      .createQueryBuilder('a')
+      .select("DATE_FORMAT(a.createdAt, '%Y-%m-%d')", 'date')
+      .addSelect('COUNT(*)', 'count')
+      .where('a.createdAt >= :from', {
+        from: new Date(Date.now() - 13 * 24 * 60 * 60 * 1000),
+      })
+      .groupBy('date')
+      .orderBy('date', 'ASC')
+      .getRawMany<{ date: string; count: string }>();
+  }
+
+  private getViolationsByType() {
+    return this.violationRepository
+      .createQueryBuilder('v')
+      .select('v.type', 'type')
+      .addSelect('COUNT(*)', 'count')
+      .groupBy('v.type')
+      .orderBy('count', 'DESC')
+      .limit(6)
+      .getRawMany<{ type: string; count: string }>();
+  }
+
+  private fillTimelineGaps(raw: { date: string; count: string }[]) {
+    const map = new Map(raw.map((r) => [r.date, Number(r.count)]));
+    return Array.from({ length: 14 }, (_, i) => {
+      const d = new Date(Date.now() - (13 - i) * 24 * 60 * 60 * 1000);
+      const key = d.toISOString().slice(0, 10);
+      return { date: key, count: map.get(key) ?? 0 };
+    });
   }
 }
