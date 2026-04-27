@@ -204,6 +204,60 @@ export class AuthService {
     };
   }
 
+  async updateProfile(
+    userId: number,
+    fullName: string,
+  ): Promise<Partial<User>> {
+    const user = await this.userRepository.findOne({ where: { id: userId } });
+
+    if (!user) {
+      throw new InvalidCredentialsException();
+    }
+
+    user.fullName = fullName;
+    const saved = await this.userRepository.save(user);
+
+    return {
+      id: saved.id,
+      userName: saved.userName,
+      fullName: saved.fullName,
+      role: saved.role,
+      status: saved.status,
+    };
+  }
+
+  async changePassword(
+    userId: number,
+    currentPassword: string,
+    newPassword: string,
+  ): Promise<void> {
+    const user = await this.userRepository.findOne({ where: { id: userId } });
+
+    if (!user) {
+      throw new InvalidCredentialsException();
+    }
+
+    const passwordMatches = await bcrypt.compare(
+      currentPassword,
+      user.password,
+    );
+
+    if (!passwordMatches) {
+      throw new InvalidCredentialsException();
+    }
+
+    user.password = await bcrypt.hash(newPassword, this.bcryptRounds);
+    await this.userRepository.save(user);
+
+    // Revoke all refresh tokens to force re-login on other devices
+    await this.refreshTokenRepository.update(
+      { userId, isRevoked: false },
+      { isRevoked: true },
+    );
+
+    this.logger.log(`Password changed for user: ${userId}`);
+  }
+
   private async buildAuthResponse(user: User): Promise<AuthResponseDto> {
     const tokenPair = this.generateTokenPair(user);
     await this.storeRefreshToken(user.id, tokenPair.refreshToken);

@@ -7,7 +7,7 @@ import {
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { ROLES_KEY } from 'src/common/decorators/roles.decorator';
-import { UserRole } from 'src/database/entities/user.entity';
+import { User, UserRole } from 'src/database/entities/user.entity';
 
 @Injectable()
 export class RolesGuard implements CanActivate {
@@ -25,9 +25,9 @@ export class RolesGuard implements CanActivate {
       return true;
     }
 
-    const request = context.switchToHttp().getRequest();
-    const user = request.user;
+    const request = context.switchToHttp().getRequest<{ user?: User }>();
 
+    const user = request.user;
     if (!user) {
       this.logger.warn('User not found in request');
       throw new ForbiddenException('User not found');

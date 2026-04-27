@@ -3,6 +3,7 @@ import {
   Post,
   Body,
   Get,
+  Patch,
   UseGuards,
   HttpCode,
   HttpStatus,
@@ -15,6 +16,9 @@ import { RefreshTokenDto } from './dto/auth-response.dto';
 import { JwtGuard } from '../../common/guards/jwt.guard';
 import { User } from 'src/database/entities/user.entity';
 import { CurrentUser } from 'src/common/decorators/current-user.decorator';
+
+import { UpdateProfileDto } from './dto/update-profile.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
 
 @Controller('auth')
 export class AuthController {
@@ -57,7 +61,33 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   async getProfile(@CurrentUser() user: User) {
     this.logger.log(`Profile request for user: ${user.id}`);
-    const { id } = user;
-    return this.authService.getProfile(id);
+    return this.authService.getProfile(user.id);
+  }
+
+  @Patch('me')
+  @UseGuards(JwtGuard)
+  @HttpCode(HttpStatus.OK)
+  async updateProfile(
+    @CurrentUser() user: User,
+    @Body() dto: UpdateProfileDto,
+  ) {
+    this.logger.log(`Update profile for user: ${user.id}`);
+    return this.authService.updateProfile(user.id, dto.fullName);
+  }
+
+  @Post('change-password')
+  @UseGuards(JwtGuard)
+  @HttpCode(HttpStatus.OK)
+  async changePassword(
+    @CurrentUser() user: User,
+    @Body() dto: ChangePasswordDto,
+  ) {
+    this.logger.log(`Change password for user: ${user.id}`);
+    await this.authService.changePassword(
+      user.id,
+      dto.currentPassword,
+      dto.newPassword,
+    );
+    return { message: 'Password changed successfully' };
   }
 }

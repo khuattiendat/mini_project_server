@@ -1,5 +1,6 @@
 import { BaseEntity } from 'src/common/base/base.entity';
-import { Column, Entity, Index, OneToMany } from 'typeorm';
+import { Column, Entity, Index, ManyToMany, OneToMany } from 'typeorm';
+import { Exam } from './exam.entity';
 import { ExamAttempt } from './examAttempt.entity';
 import { UserLog } from './userLog.entity';
 import { RefreshToken } from './refresh-token.entity';
@@ -25,6 +26,7 @@ export class User extends BaseEntity {
     name: 'user_name',
   })
   userName!: string;
+
   @Column({
     type: 'varchar',
     name: 'password',
@@ -39,6 +41,7 @@ export class User extends BaseEntity {
     nullable: false,
   })
   fullName!: string;
+
   @Index('IDX_users_device_id')
   @Column({
     name: 'device_id',
@@ -47,12 +50,14 @@ export class User extends BaseEntity {
     nullable: true,
   })
   deviceId!: string | null;
+
   @Column({
     type: 'enum',
     enum: UserRole,
     default: UserRole.USER,
   })
   role!: UserRole;
+
   @Column({
     type: 'enum',
     enum: UserStatus,
@@ -68,4 +73,7 @@ export class User extends BaseEntity {
 
   @OneToMany(() => RefreshToken, (refreshToken) => refreshToken.user)
   refreshTokens!: RefreshToken[];
+
+  @ManyToMany(() => Exam, (exam) => exam.assignedUsers)
+  assignedExams!: Exam[];
 }

@@ -6,14 +6,12 @@ import {
   JoinColumn,
   ManyToOne,
   OneToMany,
-  Unique,
 } from 'typeorm';
 import { Choice } from './choice.entity';
 import { Exam } from './exam.entity';
 import { UserAnswer } from './userAnswer.entity';
 
 @Index('IDX_questions_exam_id', ['examId'])
-@Unique('UQ_questions_exam_order', ['examId', 'orderIndex'])
 @Entity('questions')
 export class Question extends BaseEntity {
   @Column({
@@ -33,6 +31,7 @@ export class Question extends BaseEntity {
     name: 'order_index',
     type: 'int',
     nullable: false,
+    default: 1,
   })
   orderIndex!: number;
 
