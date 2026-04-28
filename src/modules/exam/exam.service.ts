@@ -1,7 +1,7 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Exam } from 'src/database/entities/exam.entity';
-import { ExamAttempt } from 'src/database/entities/examAttempt.entity';
+import { ExamAttempt, AttemptStatus } from 'src/database/entities/examAttempt.entity';
 import { Question } from 'src/database/entities/question.entity';
 import { User } from 'src/database/entities/user.entity';
 import { Violation } from 'src/database/entities/violation.entity';
@@ -81,9 +81,23 @@ export class ExamService {
     const exams = await this.examRepository
       .createQueryBuilder('exam')
       .leftJoin('exam.assignedUsers', 'assignedUser')
+      // Loại bỏ các exam mà user đã có attempt ở trạng thái không cho phép làm lại
+      // (submitted, violated, terminated) — chỉ giữ lại nếu chưa có attempt
+      // hoặc attempt đang ở initialized/active
       .where('exam.deletedAt IS NULL')
       .andWhere('exam.startDate <= :now', { now: new Date() })
       .andWhere('(exam.isPublic = true OR assignedUser.id = :userId)', { userId })
+      .andWhere(`
+        NOT EXISTS (
+          SELECT 1 FROM exam_attempts a
+          WHERE a.exam_id = exam.id
+            AND a.user_id = :userId
+            AND a.status NOT IN (:...allowedStatuses)
+        )
+      `, {
+        userId,
+        allowedStatuses: [AttemptStatus.INITIALIZED, AttemptStatus.ACTIVE],
+      })
       .orderBy('exam.startDate', 'DESC')
       .getMany();
 

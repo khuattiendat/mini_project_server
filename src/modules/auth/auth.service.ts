@@ -8,8 +8,14 @@ import { User, UserRole, UserStatus } from 'src/database/entities/user.entity';
 import { RefreshToken } from 'src/database/entities/refresh-token.entity';
 import { LoginDto } from './dto/login.dto';
 import { SignUpDto } from './dto/signup.dto';
-import { AuthResponseDto, RefreshTokenResponseDto } from './dto/auth-response.dto';
-import { IJwtPayload, ITokenPair } from '../../common/interfaces/auth.interface';
+import {
+  AuthResponseDto,
+  RefreshTokenResponseDto,
+} from './dto/auth-response.dto';
+import {
+  IJwtPayload,
+  ITokenPair,
+} from '../../common/interfaces/auth.interface';
 import {
   InvalidCredentialsException,
   InvalidTokenException,
@@ -39,15 +45,21 @@ export class AuthService {
   ) {
     this.jwtSecret = this.getRequiredEnv('JWT_SECRET');
     this.bcryptRounds = this.getNumberEnv('BCRYPT_ROUNDS');
-    this.accessTokenExpiresInSeconds = parseDurationToSeconds(this.getRequiredEnv('JWT_ACCESS_EXPIRATION'));
-    this.refreshTokenExpiresInSeconds = parseDurationToSeconds(this.getRequiredEnv('JWT_REFRESH_EXPIRATION'));
+    this.accessTokenExpiresInSeconds = parseDurationToSeconds(
+      this.getRequiredEnv('JWT_ACCESS_EXPIRATION'),
+    );
+    this.refreshTokenExpiresInSeconds = parseDurationToSeconds(
+      this.getRequiredEnv('JWT_REFRESH_EXPIRATION'),
+    );
     this.refreshTokenExpiresInMs = this.refreshTokenExpiresInSeconds * 1000;
   }
 
   // ─── Auth flows ───────────────────────────────────────────────────────────
 
   async signup(dto: SignUpDto): Promise<AuthResponseDto> {
-    const existing = await this.userRepository.findOne({ where: { userName: dto.userName } });
+    const existing = await this.userRepository.findOne({
+      where: { userName: dto.userName },
+    });
     if (existing) throw new UserAlreadyExistsException(dto.userName);
 
     const user = this.userRepository.create({
@@ -64,7 +76,9 @@ export class AuthService {
   }
 
   async login(dto: LoginDto): Promise<AuthResponseDto> {
-    const user = await this.userRepository.findOne({ where: { userName: dto.userName } });
+    const user = await this.userRepository.findOne({
+      where: { userName: dto.userName },
+    });
 
     if (!user || !(await bcrypt.compare(dto.password, user.password))) {
       throw new InvalidCredentialsException();
@@ -78,7 +92,9 @@ export class AuthService {
     return this.buildAuthResponse(user);
   }
 
-  async refreshAccessToken(refreshTokenString: string): Promise<RefreshTokenResponseDto> {
+  async refreshAccessToken(
+    refreshTokenString: string,
+  ): Promise<RefreshTokenResponseDto> {
     const payload = this.jwtService.verify<IJwtPayload>(refreshTokenString, {
       secret: this.jwtSecret,
     });
@@ -91,11 +107,14 @@ export class AuthService {
     });
 
     if (!stored) throw new InvalidTokenException();
-    if (!(await bcrypt.compare(refreshTokenString, stored.tokenHash))) throw new InvalidTokenException();
+    if (!(await bcrypt.compare(refreshTokenString, stored.tokenHash)))
+      throw new InvalidTokenException();
     if (stored.isRevoked) throw new RefreshTokenRevokedException();
     if (new Date() > stored.expiresAt) throw new RefreshTokenExpiredException();
 
-    const user = await this.userRepository.findOne({ where: { id: payload.userId } });
+    const user = await this.userRepository.findOne({
+      where: { id: payload.userId },
+    });
     if (!user) throw new InvalidTokenException();
 
     const newTokenPair = this.generateTokenPair(user);
@@ -114,7 +133,10 @@ export class AuthService {
   }
 
   async logout(userId: number): Promise<void> {
-    await this.refreshTokenRepository.update({ userId, isRevoked: false }, { isRevoked: true });
+    await this.refreshTokenRepository.update(
+      { userId, isRevoked: false },
+      { isRevoked: true },
+    );
     this.logger.log(`User logged out: id=${userId}`);
   }
 
@@ -130,14 +152,21 @@ export class AuthService {
     return this.toProfileResponse(user);
   }
 
-  async updateProfile(userId: number, fullName: string): Promise<Partial<User>> {
+  async updateProfile(
+    userId: number,
+    fullName: string,
+  ): Promise<Partial<User>> {
     const user = await this.findUserOrThrow(userId);
     user.fullName = fullName;
     const saved = await this.userRepository.save(user);
     return this.toProfileResponse(saved);
   }
 
-  async changePassword(userId: number, currentPassword: string, newPassword: string): Promise<void> {
+  async changePassword(
+    userId: number,
+    currentPassword: string,
+    newPassword: string,
+  ): Promise<void> {
     const user = await this.findUserOrThrow(userId);
 
     if (!(await bcrypt.compare(currentPassword, user.password))) {
@@ -148,7 +177,10 @@ export class AuthService {
     await this.userRepository.save(user);
 
     // Revoke all refresh tokens — force re-login on other devices
-    await this.refreshTokenRepository.update({ userId, isRevoked: false }, { isRevoked: true });
+    await this.refreshTokenRepository.update(
+      { userId, isRevoked: false },
+      { isRevoked: true },
+    );
     this.logger.log(`Password changed for user: id=${userId}`);
   }
 
@@ -193,13 +225,19 @@ export class AuthService {
       }),
       refreshToken: this.jwtService.sign(
         { ...base, type: 'refresh' },
-        { secret: this.jwtSecret, expiresIn: this.refreshTokenExpiresInSeconds },
+        {
+          secret: this.jwtSecret,
+          expiresIn: this.refreshTokenExpiresInSeconds,
+        },
       ),
       expiresIn: this.accessTokenExpiresInSeconds,
     };
   }
 
-  private async storeRefreshToken(userId: number, refreshToken: string): Promise<void> {
+  private async storeRefreshToken(
+    userId: number,
+    refreshToken: string,
+  ): Promise<void> {
     await this.refreshTokenRepository.save(
       this.refreshTokenRepository.create({
         userId,
@@ -221,7 +259,8 @@ export class AuthService {
 
   private getRequiredEnv(key: string): string {
     const value = this.configService.get<string>(key)?.trim().replace(/;$/, '');
-    if (!value) throw new Error(`Missing required environment variable: ${key}`);
+    if (!value)
+      throw new Error(`Missing required environment variable: ${key}`);
     return value;
   }
 
