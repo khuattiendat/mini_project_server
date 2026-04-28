@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { IsInt, IsOptional, IsString, Min } from 'class-validator';
+import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 
 export class BaseQuryDto {
   @IsOptional()
@@ -12,6 +12,7 @@ export class BaseQuryDto {
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(1000)
   limit?: number;
 
   @IsOptional()
