@@ -2,6 +2,7 @@ export const REDIS_CLIENT = 'REDIS_CLIENT';
 
 export const REDIS_KEYS = {
   submitLock: (attemptId: number) => `lock:submit:${attemptId}`,
+  startLock: (userId: number, examId: number) => `lock:start:${userId}:${examId}`,
   attemptSession: (attemptId: number) => `attempt:session:${attemptId}`,
 };
 

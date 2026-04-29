@@ -81,18 +81,24 @@ export class ExamService {
     const exams = await this.examRepository
       .createQueryBuilder('exam')
       .leftJoin('exam.assignedUsers', 'assignedUser')
-      // Loại bỏ các exam mà user đã có attempt ở trạng thái không cho phép làm lại
-      // (submitted, violated, terminated) — chỉ giữ lại nếu chưa có attempt
-      // hoặc attempt đang ở initialized/active
       .where('exam.deletedAt IS NULL')
       .andWhere('exam.startDate <= :now', { now: new Date() })
       .andWhere('(exam.isPublic = true OR assignedUser.id = :userId)', { userId })
+      // Chỉ loại exam nếu attempt MỚI NHẤT của user đang ở trạng thái cuối
+      // (submitted / violated / terminated). Nếu admin đã "cho thi lại" thì
+      // attempt mới nhất sẽ là initialized → exam xuất hiện lại.
       .andWhere(`
         NOT EXISTS (
           SELECT 1 FROM exam_attempts a
           WHERE a.exam_id = exam.id
             AND a.user_id = :userId
             AND a.status NOT IN (:...allowedStatuses)
+            AND a.attempt_no = (
+              SELECT MAX(a2.attempt_no)
+              FROM exam_attempts a2
+              WHERE a2.exam_id = exam.id
+                AND a2.user_id = :userId
+            )
         )
       `, {
         userId,
@@ -207,6 +213,51 @@ export class ExamService {
 
     this.logger.log(`Exam deleted: id=${id}`);
     return { message: 'Exam deleted successfully' };
+  }
+
+  // ─── Admin: Exam History ─────────────────────────────────────────────────
+
+  async getExamHistory(examId: number, search?: string) {
+    await this.findExamOrThrow(examId);
+
+    const qb = this.attemptRepository
+      .createQueryBuilder('attempt')
+      .leftJoinAndSelect('attempt.user', 'user')
+      .leftJoinAndSelect('attempt.violations', 'violations')
+      .where('attempt.examId = :examId', { examId });
+
+    if (search?.trim()) {
+      qb.andWhere(
+        '(user.fullName LIKE :s OR user.userName LIKE :s)',
+        { s: `%${search.trim()}%` },
+      );
+    }
+
+    const attempts = await qb
+      .orderBy('attempt.createdAt', 'DESC')
+      .addOrderBy('violations.createdAt', 'DESC')
+      .getMany();
+
+    return attempts.map((attempt) => ({
+      id: attempt.id,
+      attemptNo: attempt.attemptNo,
+      status: attempt.status,
+      startedAt: attempt.startedAt,
+      submittedAt: attempt.submittedAt,
+      endedAt: attempt.endedAt,
+      createdAt: attempt.createdAt,
+      user: {
+        id: attempt.user?.id ?? attempt.userId,
+        userName: attempt.user?.userName ?? '',
+        fullName: attempt.user?.fullName ?? '',
+      },
+      violations: (attempt.violations ?? []).map((v) => ({
+        id: v.id,
+        type: v.type,
+        metadata: v.metadata,
+        createdAt: v.createdAt,
+      })),
+    }));
   }
 
   // ─── User Assignment ──────────────────────────────────────────────────────

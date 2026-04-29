@@ -39,8 +39,9 @@ export class ExamNotAvailableException extends HttpException {
 export class SubmitConflictException extends HttpException {
   constructor() {
     super(
-      'Bài thi đang được xử lý, vui lòng không nộp lại.',
+      'Bài thi đang được xử lý, vui lòng chờ!',
       HttpStatus.CONFLICT,
     );
   }
 }
+

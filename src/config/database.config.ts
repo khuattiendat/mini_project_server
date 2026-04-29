@@ -14,7 +14,6 @@ export const databaseConfig = (
   entities: [join(__dirname, '/../**/*.entity{.ts,.js}')],
   autoLoadEntities: true,
   synchronize: false,
-  timezone: '+07:00',
   extra: {
     connectionLimit: 3,
     enableKeepAlive: true,

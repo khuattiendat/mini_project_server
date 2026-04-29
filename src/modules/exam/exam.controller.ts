@@ -83,6 +83,17 @@ export class ExamController {
     return this.examService.remove(id);
   }
 
+  // ── History endpoint (admin only) ─────────────────────────────────────────
+
+  @Get(':id/history')
+  @HttpCode(HttpStatus.OK)
+  async getExamHistory(
+    @Param('id', ParseIntPipe) id: number,
+    @Query('search') search?: string,
+  ) {
+    return this.examService.getExamHistory(id, search);
+  }
+
   // ── Assignment endpoints (admin only) ──────────────────────────────────────
 
   @Get(':id/assigned-users')

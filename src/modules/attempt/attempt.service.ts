@@ -18,7 +18,10 @@ import {
   ExamNotAvailableException,
   SubmitConflictException,
 } from 'src/common/exceptions/attempt.exception';
-import { ViolationService, ViolationType } from '../violation/violation.service';
+import {
+  ViolationService,
+  ViolationType,
+} from '../violation/violation.service';
 import { RedisService } from '../redis/redis.service';
 import {
   ATTEMPT_SESSION_TTL,
@@ -101,6 +104,18 @@ export class AttemptService {
   // ─── Start attempt ────────────────────────────────────────────────────────
 
   async startAttempt(userId: number, dto: StartAttemptDto) {
+    const lockKey = REDIS_KEYS.startLock(userId, dto.examId);
+    const acquired = await this.redisService.acquireLock(lockKey, 120);
+    if (!acquired) throw new SubmitConflictException();
+
+    try {
+      return await this._startAttempt(userId, dto);
+    } finally {
+      await this.redisService.releaseLock(lockKey);
+    }
+  }
+
+  private async _startAttempt(userId: number, dto: StartAttemptDto) {
     const deviceId = dto.device_id;
     const exam = await this.examRepository
       .createQueryBuilder('exam')
@@ -180,8 +195,7 @@ export class AttemptService {
           attemptId: err._violatedAttemptId,
           userId,
           type: ViolationType.DEVICE_MISMATCH,
-          message: 'Thiết bị không khớp khi bắt đầu bài thi. Đã khóa attempt.',
-          metadata: { examId: dto.examId, receivedDeviceId: dto.device_id },
+          message: 'Phát hiện đăng nhập từ thiết bị khác khi bắt đầu bài thi.',
         });
       }
       throw err;
@@ -218,18 +232,19 @@ export class AttemptService {
         attemptId: attempt.id,
         userId,
         type: ViolationType.DEVICE_MISMATCH,
-        message: 'Thiết bị không khớp khi vào trang làm bài. Đã khóa attempt.',
-        metadata: { examId, receivedDeviceId: deviceId },
+        message: 'Phát hiện đăng nhập từ thiết bị khác khi vào trang làm bài.',
       });
       throw new AttemptViolatedException();
     }
 
     this.assertAttemptAllowed(attempt.status);
 
-    // Reset startedAt mỗi khi user thực sự vào trang làm bài
-    // → đảm bảo thời gian đếm ngược tính từ lúc bắt đầu làm, không phải lúc tạo attempt
+    // Chỉ set startedAt lần đầu tiên (khi chưa có hoặc status chưa ACTIVE)
+    // Các lần reload sau giữ nguyên startedAt để tính đúng thời gian đã làm
+    if (attempt.status !== AttemptStatus.ACTIVE || !attempt.startedAt) {
+      attempt.startedAt = new Date();
+    }
     attempt.status = AttemptStatus.ACTIVE;
-    attempt.startedAt = new Date();
     await this.attemptRepository.save(attempt);
     await this.syncSession(attempt);
 
@@ -279,23 +294,24 @@ export class AttemptService {
         attemptId,
         userId,
         type: ViolationType.DEVICE_MISMATCH,
-        message: 'Phát hiện thiết bị khác nhau trong quá trình làm bài (ping).',
-        metadata: { receivedDeviceId: deviceId },
+        message: 'Phát hiện đăng nhập từ thiết bị khác trong quá trình làm bài.',
       });
 
       return {
         status: AttemptStatus.VIOLATED,
         locked: true,
-        message: 'Phát hiện thiết bị không hợp lệ. Bài thi đã bị khóa.',
+        message: 'Bài thi đã bị khóa do phát hiện đăng nhập từ thiết bị khác.',
       };
     }
 
     // Whitelist: chỉ ACTIVE/INITIALIZED mới được tiếp tục
     if (!ALLOWED.includes(session.status)) {
       const messages: Partial<Record<AttemptStatus, string>> = {
-        [AttemptStatus.SUBMITTED]: 'Bài thi đã được nộp.',
-        [AttemptStatus.VIOLATED]: 'Bài thi đã bị khóa do vi phạm quy chế. Vui lòng liên hệ giám thị.',
-        [AttemptStatus.TERMINATED]: 'Bài thi đã bị kết thúc. Vui lòng liên hệ giám thị.',
+        [AttemptStatus.SUBMITTED]: 'Bài thi của bạn đã được nộp thành công.',
+        [AttemptStatus.VIOLATED]:
+          'Bài thi đã bị khóa do vi phạm quy chế. Vui lòng liên hệ giám thị để được hỗ trợ.',
+        [AttemptStatus.TERMINATED]:
+          'Lượt thi của bạn đã bị kết thúc bởi giám thị. Vui lòng liên hệ giám thị để biết thêm chi tiết.',
       };
       return {
         status: session.status,
@@ -311,11 +327,14 @@ export class AttemptService {
     return { status: session.status, locked: false };
   }
 
-
-  async submitAttempt(userId: number, attemptId: number, dto: SubmitAttemptDto) {
+  async submitAttempt(
+    userId: number,
+    attemptId: number,
+    dto: SubmitAttemptDto,
+  ) {
     const lockKey = REDIS_KEYS.submitLock(attemptId);
-
-    const acquired = await this.redisService.acquireLock(lockKey, 30);
+    // Cố gắng acquire submit lock trong 120 giây
+    const acquired = await this.redisService.acquireLock(lockKey, 120);
     if (!acquired) throw new SubmitConflictException();
 
     try {
@@ -414,7 +433,143 @@ export class AttemptService {
     }
   }
 
+  // ─── Admin: Reset attempt (cho thi lại) ──────────────────────────────────
+
+  async adminResetAttempt(examId: number, userId: number) {
+    const newAttempt = await this.dataSource.transaction(async (manager) => {
+      const repo = manager.getRepository(ExamAttempt);
+
+      // Pessimistic write lock — đọc attempt mới nhất, chặn concurrent writes
+      const last = await repo
+        .createQueryBuilder('a')
+        .where('a.userId = :userId AND a.examId = :examId', { userId, examId })
+        .orderBy('a.attemptNo', 'DESC')
+        .setLock('pessimistic_write')
+        .getOne();
+
+      // Nếu attempt mới nhất đang INITIALIZED/ACTIVE → không cần tạo mới
+      if (
+        last &&
+        (last.status === AttemptStatus.INITIALIZED ||
+          last.status === AttemptStatus.ACTIVE)
+      ) {
+        return last;
+      }
+
+      // Clone từ attempt cũ: giữ deviceId để user không bị device mismatch
+      // Reset các field thời gian và status về trạng thái ban đầu
+      const created = repo.create({
+        userId,
+        examId,
+        attemptNo: last ? last.attemptNo + 1 : 1,
+        status: AttemptStatus.INITIALIZED,
+        deviceId: null,
+        startedAt: null,
+        submittedAt: null,
+        endedAt: null,
+      });
+      return repo.save(created);
+    });
+
+
+    this.logger.log(
+      `Admin reset attempt: userId=${userId}, examId=${examId}, newAttemptId=${newAttempt.id}, attemptNo=${newAttempt.attemptNo}`,
+    );
+
+    return {
+      id: newAttempt.id,
+      attemptNo: newAttempt.attemptNo,
+      status: newAttempt.status,
+    };
+  }
+
+  // ─── Admin: Terminate attempt (cấm thi) ──────────────────────────────────
+
+  async adminTerminateAttempt(attemptId: number) {
+    // Dùng submitLock để tránh race với user đang submit cùng lúc
+    const lockKey = REDIS_KEYS.submitLock(attemptId);
+    const acquired = await this.redisService.acquireLock(lockKey, 30);
+    if (!acquired) throw new SubmitConflictException();
+
+    try {
+      const attempt = await this.dataSource.transaction(async (manager) => {
+        const repo = manager.getRepository(ExamAttempt);
+
+        const found = await repo
+          .createQueryBuilder('a')
+          .where('a.id = :id', { id: attemptId })
+          .setLock('pessimistic_write')
+          .getOne();
+
+        if (!found) throw new NotFoundException('Attempt not found');
+
+        // Idempotent: đã terminated rồi thì trả về luôn
+        if (found.status === AttemptStatus.TERMINATED) return found;
+
+        found.status = AttemptStatus.TERMINATED;
+        found.endedAt = new Date();
+        return repo.save(found);
+      });
+
+      // Sync Redis ngay sau transaction — ghi đè bất kỳ session cũ nào
+      await this.syncSession(attempt);
+
+      this.logger.warn(
+        `Admin terminated attempt: attemptId=${attemptId}, userId=${attempt.userId}`,
+      );
+
+      return { id: attempt.id, status: attempt.status };
+    } finally {
+      await this.redisService.releaseLock(lockKey);
+    }
+  }
+
   // ─── Other getters ────────────────────────────────────────────────────────
+
+  // ─── Lock attempt (client-side violation) ─────────────────────────────────
+
+  async lockAttempt(
+    userId: number,
+    attemptId: number,
+    violationType: ViolationType,
+    message: string,
+  ) {
+    // Cập nhật DB
+    const attempt = await this.attemptRepository.findOne({
+      where: { id: attemptId, userId },
+    });
+    if (!attempt) throw new NotFoundException('Attempt not found');
+
+    // Chỉ lock nếu đang ACTIVE/INITIALIZED — bỏ qua nếu đã ở trạng thái cuối
+    if (
+      attempt.status === AttemptStatus.SUBMITTED ||
+      attempt.status === AttemptStatus.VIOLATED ||
+      attempt.status === AttemptStatus.TERMINATED
+    ) {
+      return { locked: true, status: attempt.status };
+    }
+
+    attempt.status = AttemptStatus.VIOLATED;
+    await this.attemptRepository.save(attempt);
+
+    // Sync Redis ngay lập tức
+    await this.syncSession(attempt);
+
+    // Ghi log vi phạm
+    await this.violationService.logViolation({
+      attemptId,
+      userId,
+      type: violationType,
+      message,
+      metadata: { source: 'client' },
+    });
+
+    this.logger.warn(
+      `Attempt locked by client: attemptId=${attemptId}, userId=${userId}, type=${violationType}`,
+    );
+
+    return { locked: true, status: AttemptStatus.VIOLATED };
+  }
 
   async getAttemptDetail(userId: number, attemptId: number) {
     const attempt = await this.attemptRepository.findOne({
@@ -435,8 +590,10 @@ export class AttemptService {
 
   private assertAttemptAllowed(status: AttemptStatus) {
     if (status === AttemptStatus.VIOLATED) throw new AttemptViolatedException();
-    if (status === AttemptStatus.SUBMITTED) throw new AttemptAlreadySubmittedException();
-    if (status === AttemptStatus.TERMINATED) throw new AttemptTerminatedException();
+    if (status === AttemptStatus.SUBMITTED)
+      throw new AttemptAlreadySubmittedException();
+    if (status === AttemptStatus.TERMINATED)
+      throw new AttemptTerminatedException();
   }
 
   private async buildAttemptResponse(attempt: ExamAttempt, exam: Exam) {

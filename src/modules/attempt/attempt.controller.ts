@@ -18,6 +18,7 @@ import { AttemptService } from './attempt.service';
 import { StartAttemptDto } from './dto/start-attempt.dto';
 import { SubmitAttemptDto } from './dto/submit-attempt.dto';
 import { PingAttemptDto } from './dto/ping-attempt.dto';
+import { LockAttemptDto } from './dto/lock-attempt.dto';
 
 @UseGuards(JwtGuard, RolesGuard)
 @Roles(UserRole.USER)
@@ -65,5 +66,38 @@ export class AttemptController {
     @Body() dto: PingAttemptDto,
   ) {
     return this.attemptService.pingAttempt(user.id, id, dto.device_id);
+  }
+
+  @Post(':id/lock')
+  @HttpCode(HttpStatus.OK)
+  lock(
+    @CurrentUser() user: User,
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: LockAttemptDto,
+  ) {
+    return this.attemptService.lockAttempt(
+      user.id,
+      id,
+      dto.violation_type,
+      dto.message ?? `Vi phạm: ${dto.violation_type}`,
+    );
+  }
+
+
+  @Post('admin/reset')
+  @Roles(UserRole.ADMIN)
+  @HttpCode(HttpStatus.OK)
+  adminReset(
+    @Body('examId', ParseIntPipe) examId: number,
+    @Body('userId', ParseIntPipe) userId: number,
+  ) {
+    return this.attemptService.adminResetAttempt(examId, userId);
+  }
+
+  @Post(':id/admin/terminate')
+  @Roles(UserRole.ADMIN)
+  @HttpCode(HttpStatus.OK)
+  adminTerminate(@Param('id', ParseIntPipe) id: number) {
+    return this.attemptService.adminTerminateAttempt(id);
   }
 }
