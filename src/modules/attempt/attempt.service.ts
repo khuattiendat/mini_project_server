@@ -25,6 +25,7 @@ import {
 import { RedisService } from '../redis/redis.service';
 import {
   ATTEMPT_SESSION_TTL,
+  VIOLATION_BUFFER_TTL,
   REDIS_KEYS,
 } from 'src/common/constants/redis.constants';
 
@@ -66,39 +67,6 @@ export class AttemptService {
       lastPingAt: new Date().toISOString(),
     };
     await this.redisService.setJson(key, session, ATTEMPT_SESSION_TTL);
-  }
-
-  /**
-   * Đọc session từ Redis. Nếu miss → load từ DB rồi warm cache.
-   */
-  private async loadSession(
-    attemptId: number,
-    userId: number,
-  ): Promise<{ session: AttemptSession; attempt: ExamAttempt }> {
-    const key = REDIS_KEYS.attemptSession(attemptId);
-    const cached = await this.redisService.getJson<AttemptSession>(key);
-
-    if (cached) {
-      // Trả về session từ cache, kèm attempt stub (chỉ cần id + userId để validate)
-      const attempt = { id: attemptId, userId } as ExamAttempt;
-      return { session: cached, attempt };
-    }
-
-    // Cache miss → fallback DB
-    const attempt = await this.attemptRepository.findOne({
-      where: { id: attemptId, userId },
-    });
-    if (!attempt) throw new NotFoundException('Attempt not found');
-
-    // Warm cache
-    await this.syncSession(attempt);
-
-    const session: AttemptSession = {
-      status: attempt.status,
-      deviceId: attempt.deviceId,
-      lastPingAt: new Date().toISOString(),
-    };
-    return { session, attempt };
   }
 
   // ─── Start attempt ────────────────────────────────────────────────────────
@@ -254,7 +222,6 @@ export class AttemptService {
     return this.buildAttemptResponse(attempt, exam);
   }
 
-  // ─── Ping ─────────────────────────────────────────────────────────────────
 
   async pingAttempt(userId: number, attemptId: number, deviceId: string) {
     const key = REDIS_KEYS.attemptSession(attemptId);
@@ -297,6 +264,9 @@ export class AttemptService {
         message: 'Phát hiện đăng nhập từ thiết bị khác trong quá trình làm bài.',
       });
 
+      // Flush buffer vi phạm xuống DB
+      await this.violationService.flushViolationBuffer(attemptId);
+
       return {
         status: AttemptStatus.VIOLATED,
         locked: true,
@@ -320,9 +290,17 @@ export class AttemptService {
       };
     }
 
-    // Hợp lệ → refresh TTL
+    // Hợp lệ → refresh TTL cho cả session lẫn violation buffer
     session.lastPingAt = new Date().toISOString();
     await this.redisService.setJson(key, session, ATTEMPT_SESSION_TTL);
+
+    // Gia hạn TTL violation buffer về 24h — đảm bảo buffer không hết hạn
+    // trong suốt thời gian bài thi còn active (dù không có vi phạm mới)
+    const bufferKey = REDIS_KEYS.violationBuffer(attemptId);
+    const bufferExists = await this.redisService.exists(bufferKey);
+    if (bufferExists) {
+      await this.redisService.expire(bufferKey, VIOLATION_BUFFER_TTL);
+    }
 
     return { status: session.status, locked: false };
   }
@@ -421,8 +399,9 @@ export class AttemptService {
 
       // Sync Redis sau khi transaction commit
       await this.syncSession(result.savedAttempt);
-      // Xóa submit lock key (releaseLock trong finally cũng xóa, nhưng xóa session lock sớm)
-      await this.redisService.del(REDIS_KEYS.submitLock(attemptId));
+      // Flush toàn bộ buffer vi phạm xuống DB
+      await this.violationService.flushViolationBuffer(attemptId);
+      // Bug 3 fix: bỏ del(submitLock) thừa — releaseLock trong finally đã xử lý
 
       this.logger.log(
         `Attempt submitted: attemptId=${attemptId}, userId=${userId}, score=${result.score.score}`,
@@ -513,6 +492,8 @@ export class AttemptService {
 
       // Sync Redis ngay sau transaction — ghi đè bất kỳ session cũ nào
       await this.syncSession(attempt);
+      // Flush buffer vi phạm xuống DB
+      await this.violationService.flushViolationBuffer(attempt.id);
 
       this.logger.warn(
         `Admin terminated attempt: attemptId=${attemptId}, userId=${attempt.userId}`,
@@ -534,7 +515,6 @@ export class AttemptService {
     violationType: ViolationType,
     message: string,
   ) {
-    // Cập nhật DB
     const attempt = await this.attemptRepository.findOne({
       where: { id: attemptId, userId },
     });
@@ -555,7 +535,10 @@ export class AttemptService {
     // Sync Redis ngay lập tức
     await this.syncSession(attempt);
 
-    // Ghi log vi phạm
+    // Flush toàn bộ buffer vi phạm xuống DB trước khi ghi vi phạm cuối
+    await this.violationService.flushViolationBuffer(attemptId);
+
+    // Ghi vi phạm lock cuối cùng trực tiếp vào DB (không qua buffer)
     await this.violationService.logViolation({
       attemptId,
       userId,
@@ -569,6 +552,57 @@ export class AttemptService {
     );
 
     return { locked: true, status: AttemptStatus.VIOLATED };
+  }
+
+  // ─── Log violation only (buffer vào Redis, không ghi DB ngay) ───────────
+
+  /**
+   * Đẩy vi phạm vào Redis buffer — không thay đổi status, không ghi DB.
+   * Buffer sẽ được flush xuống DB khi bài thi kết thúc.
+   * Vẫn chấp nhận ngay cả khi attempt đã SUBMITTED/VIOLATED/TERMINATED
+   * để không mất log trong edge case.
+   */
+  async logViolationOnly(
+    userId: number,
+    attemptId: number,
+    violationType: ViolationType,
+    message: string,
+    metadata?: Record<string, any>,
+  ): Promise<{ violationId: number }> {
+    const attempt = await this.attemptRepository.findOne({
+      where: { id: attemptId, userId },
+    });
+    if (!attempt) throw new NotFoundException('Attempt not found');
+
+    const result = await this.violationService.bufferViolation({
+      attemptId,
+      type: violationType,
+      message,
+      metadata,
+    });
+
+    this.logger.log(
+      `Violation buffered: attemptId=${attemptId}, userId=${userId}, type=${violationType}, bufferIndex=${result.violationId}`,
+    );
+
+    return result;
+  }
+
+  /**
+   * Đánh dấu vi phạm trong Redis buffer là đã resolved.
+   * violationId ở đây là bufferIndex trả về từ logViolationOnly.
+   */
+  async resolveViolation(
+    userId: number,
+    attemptId: number,
+    violationId: number,
+  ): Promise<void> {
+    const attempt = await this.attemptRepository.findOne({
+      where: { id: attemptId, userId },
+    });
+    if (!attempt) throw new NotFoundException('Attempt not found');
+
+    await this.violationService.resolveBufferedViolation(attemptId, violationId);
   }
 
   async getAttemptDetail(userId: number, attemptId: number) {

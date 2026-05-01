@@ -19,6 +19,7 @@ import { StartAttemptDto } from './dto/start-attempt.dto';
 import { SubmitAttemptDto } from './dto/submit-attempt.dto';
 import { PingAttemptDto } from './dto/ping-attempt.dto';
 import { LockAttemptDto } from './dto/lock-attempt.dto';
+import { LogViolationDto } from './dto/log-violation.dto';
 
 @UseGuards(JwtGuard, RolesGuard)
 @Roles(UserRole.USER)
@@ -81,6 +82,39 @@ export class AttemptController {
       dto.violation_type,
       dto.message ?? `Vi phạm: ${dto.violation_type}`,
     );
+  }
+
+  /**
+   * Ghi log vi phạm mà không thay đổi trạng thái bài thi.
+   * Dùng cho grace period violations và COPY_PASTE warnings.
+   */
+  @Post(':id/violation-log')
+  @HttpCode(HttpStatus.OK)
+  logViolation(
+    @CurrentUser() user: User,
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: LogViolationDto,
+  ) {
+    return this.attemptService.logViolationOnly(
+      user.id,
+      id,
+      dto.violation_type,
+      dto.message ?? `Vi phạm: ${dto.violation_type}`,
+      dto.metadata,
+    );
+  }
+
+  /**
+   * Đánh dấu vi phạm đã được giải quyết (thí sinh quay lại trong grace period).
+   */
+  @Post(':id/violation-log/:violationId/resolve')
+  @HttpCode(HttpStatus.OK)
+  resolveViolation(
+    @CurrentUser() user: User,
+    @Param('id', ParseIntPipe) id: number,
+    @Param('violationId', ParseIntPipe) violationId: number,
+  ) {
+    return this.attemptService.resolveViolation(user.id, id, violationId);
   }
 
 

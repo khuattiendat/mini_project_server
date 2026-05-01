@@ -72,6 +72,45 @@ export class RedisService implements OnModuleDestroy {
   }
 
 
+  // ── List operations (dùng cho violation buffer) ───────────────────────────
+
+  /** Append một JSON item vào cuối list, trả về index (0-based) của item vừa push */
+  async rpushJson<T>(key: string, value: T, ttl?: number): Promise<number> {
+    const len = await this.client.rpush(key, JSON.stringify(value));
+    if (ttl) await this.client.expire(key, ttl);
+    // len là độ dài list sau khi push → index = len - 1
+    return len - 1;
+  }
+
+  /** Đọc toàn bộ list dưới dạng mảng JSON */
+  async lrangeJson<T>(key: string): Promise<T[]> {
+    const items = await this.client.lrange(key, 0, -1);
+    return items.map((raw) => {
+      try { return JSON.parse(raw) as T; }
+      catch { return null as unknown as T; }
+    }).filter(Boolean);
+  }
+
+  /**
+   * Đọc một item tại index cụ thể trong list (Bug 5 fix: dùng LINDEX thay LRANGE).
+   * Hiệu quả hơn khi chỉ cần đọc 1 item trong list lớn.
+   */
+  async lindexJson<T>(key: string, index: number): Promise<T | null> {
+    const raw = await this.client.lindex(key, index);
+    if (!raw) return null;
+    try { return JSON.parse(raw) as T; }
+    catch { return null; }
+  }
+
+  /** Cập nhật item tại index trong list */
+  async lsetJson<T>(key: string, index: number, value: T): Promise<void> {
+    await this.client.lset(key, index, JSON.stringify(value));
+  }
+
+  /** Độ dài list */
+  llen(key: string): Promise<number> {
+    return this.client.llen(key);
+  }
   async onModuleDestroy(): Promise<void> {
     await this.client.quit();
   }
