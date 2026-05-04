@@ -117,7 +117,6 @@ export class AttemptController {
     return this.attemptService.resolveViolation(user.id, id, violationId);
   }
 
-
   @Post('admin/reset')
   @Roles(UserRole.ADMIN)
   @HttpCode(HttpStatus.OK)

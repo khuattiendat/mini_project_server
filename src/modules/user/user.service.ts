@@ -35,6 +35,7 @@ export class UserService {
       password: await bcrypt.hash(dto.password, this.bcryptRounds),
       fullName: dto.fullName,
       status: dto.status ?? UserStatus.ACTIVE,
+      createdAt:  new Date(),
     });
 
     const saved = await this.userRepository.save(user);

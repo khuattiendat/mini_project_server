@@ -115,9 +115,15 @@ export class ViolationService {
       createdAt,
     });
 
-    const bufferIndex = await this.redisService
+    const bufferIndex = (await this.redisService
       .getClient()
-      .eval(luaScript, 1, key, placeholder, String(VIOLATION_BUFFER_TTL)) as number;
+      .eval(
+        luaScript,
+        1,
+        key,
+        placeholder,
+        String(VIOLATION_BUFFER_TTL),
+      )) as number;
 
     // Cập nhật bufferIndex chính xác vào item (LSET ngay sau RPUSH trong cùng pipeline)
     const finalItem = JSON.stringify({
@@ -147,7 +153,10 @@ export class ViolationService {
     const key = REDIS_KEYS.violationBuffer(attemptId);
 
     // Bug 5 fix: dùng LINDEX thay LRANGE — chỉ đọc 1 item thay vì toàn bộ list
-    const item = await this.redisService.lindexJson<BufferedViolation>(key, bufferIndex);
+    const item = await this.redisService.lindexJson<BufferedViolation>(
+      key,
+      bufferIndex,
+    );
 
     if (!item) {
       this.logger.warn(
