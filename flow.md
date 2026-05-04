@@ -466,7 +466,118 @@ Kết thúc phiên (submit thành công / lock)
 
 ---
 
-## 8. Bảng chuyển trạng thái đầy đủ
+## 8. Graceful Degradation — Xử lý khi Redis crash
+
+Hệ thống sử dụng Redis cho ba mục đích: distributed lock, session cache, và violation buffer. Khi Redis down, mỗi mục đích có chiến lược fallback riêng để đảm bảo hệ thống tiếp tục hoạt động.
+
+---
+
+### 8.1 Nguyên tắc chung
+
+Toàn bộ method trong `RedisService` được bọc trong `try/catch`. Khi Redis down:
+- Các method **đọc** (`get`, `getJson`, `lrangeJson`, ...) trả về `null` / `[]` thay vì throw.
+- Các method **ghi** (`set`, `setJson`, `del`, ...) log warn và trả về giá trị mặc định, không throw.
+- `acquireLock` trả về `true` (allow through) thay vì throw — DB pessimistic lock đảm nhận vai trò bảo vệ.
+
+---
+
+### 8.2 Distributed Lock — fallback về DB Pessimistic Lock
+
+```
+Redis healthy:
+  acquireLock() = OK/FAIL → chỉ 1 request đi qua → DB lock → commit
+
+Redis down:
+  acquireLock() = true (allow through, không throw)
+  → Tất cả request đi vào DB
+  → DB SELECT ... FOR UPDATE chặn concurrent writes
+  → assertAttemptAllowed(status) từ chối request trùng lặp
+```
+
+**Hệ quả:** Mất lớp chặn sớm (Redis), nhưng tính đúng đắn vẫn được đảm bảo bởi DB lock. Tải DB tăng nhẹ trong thời gian Redis down.
+
+---
+
+### 8.3 Session Cache — fallback về DB
+
+```
+Redis healthy:
+  pingAttempt() → getJson(session) → đọc từ Redis (không hit DB)
+
+Redis down:
+  pingAttempt() → getJson() = null (không throw)
+  → fallback: findOne() từ DB
+  → syncSession() (best-effort, không throw nếu Redis vẫn down)
+  → tiếp tục xử lý bình thường
+```
+
+**Hệ quả:** Mỗi ping đều hit DB thay vì Redis. Với ping interval 30 giây, tải tăng thêm 1 DB query/30s/thí sinh — chấp nhận được.
+
+---
+
+### 8.4 Violation Buffer — fallback ghi thẳng DB
+
+Đây là điểm quan trọng nhất vì liên quan đến tính toàn vẹn dữ liệu vi phạm.
+
+```
+Redis healthy:
+  bufferViolation() → RPUSH vào Redis list
+  → flush xuống DB khi bài thi kết thúc
+  → resolveBufferedViolation() đánh dấu resolved trong buffer
+
+Redis down:
+  bufferViolation() → RPUSH fail → catch
+  → ghi thẳng vào DB ngay lập tức (metadata có redisDown: true)
+  → trả về violationId = -1
+
+  resolveBufferedViolation(violationId = -1) → bỏ qua silently
+  (vi phạm đã ở DB, không có gì trong buffer để resolve)
+
+  flushViolationBuffer() → lrangeJson() = [] → không làm gì
+  (không có buffer, không có gì để flush)
+```
+
+**Hệ quả:** Vi phạm không bị mất. Mất tính năng "resolved" cho grace period violations (không phân biệt được vi phạm đã giải quyết hay chưa), nhưng dữ liệu vẫn được ghi nhận đầy đủ.
+
+---
+
+### 8.5 syncSession — best-effort, không block
+
+```
+Redis healthy:  syncSession() → setJson() → ghi Redis
+Redis down:     syncSession() → setJson() → catch → log warn → return
+                (không throw, không block luồng chính)
+```
+
+DB luôn là source of truth. Mất Redis cache chỉ ảnh hưởng đến hiệu năng ping, không ảnh hưởng đến tính đúng đắn.
+
+---
+
+### 8.6 Tổng hợp hành vi khi Redis down
+
+| Chức năng              | Redis healthy          | Redis down                              | Mất gì?                        |
+|------------------------|------------------------|-----------------------------------------|--------------------------------|
+| `submit` / `start`     | Redis lock + DB lock   | DB lock only (allow through)            | Lớp chặn sớm, tải DB tăng nhẹ |
+| `adminTerminate`       | Redis lock + DB lock   | DB lock only                            | Như trên                       |
+| `pingAttempt`          | Đọc Redis cache        | Fallback DB mỗi ping                    | Hiệu năng (1 DB query/30s)     |
+| `bufferViolation`      | Buffer Redis           | Ghi thẳng DB                            | Tính năng "resolved" grace     |
+| `resolveViolation`     | Update Redis buffer    | Bỏ qua silently                         | Trạng thái resolved            |
+| `flushViolationBuffer` | Flush Redis → DB       | Không làm gì (buffer rỗng)              | Không mất (đã ghi DB trực tiếp)|
+| `syncSession`          | Ghi Redis cache        | Log warn, tiếp tục                      | Cache (ping fallback DB)       |
+
+---
+
+### 8.7 Những gì KHÔNG bị ảnh hưởng khi Redis down
+
+- Trạng thái phiên thi (DB là source of truth)
+- Kết quả nộp bài và điểm số
+- Dữ liệu vi phạm (fallback ghi DB trực tiếp)
+- Tính đúng đắn của race condition (DB pessimistic lock)
+- Auto-save đáp án (localStorage, không liên quan Redis)
+
+---
+
+## 9. Bảng chuyển trạng thái đầy đủ
 
 | Từ trạng thái  | Sự kiện                                      | Đến trạng thái | Tác nhân     |
 |----------------|----------------------------------------------|----------------|--------------|

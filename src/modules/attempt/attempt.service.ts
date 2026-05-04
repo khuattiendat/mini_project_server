@@ -58,6 +58,8 @@ export class AttemptService {
 
   /**
    * Ghi session vào Redis. Gọi sau mọi thay đổi status.
+   * Graceful degradation: nếu Redis down → log warn, không throw.
+   * DB là source of truth — mất cache chỉ tăng tải DB ở ping, không mất dữ liệu.
    */
   private async syncSession(attempt: ExamAttempt): Promise<void> {
     const key = REDIS_KEYS.attemptSession(attempt.id);
@@ -66,6 +68,7 @@ export class AttemptService {
       deviceId: attempt.deviceId,
       lastPingAt: new Date().toISOString(),
     };
+    // setJson đã có try/catch bên trong RedisService — không throw
     await this.redisService.setJson(key, session, ATTEMPT_SESSION_TTL);
   }
 
@@ -73,12 +76,14 @@ export class AttemptService {
 
   async startAttempt(userId: number, dto: StartAttemptDto) {
     const lockKey = REDIS_KEYS.startLock(userId, dto.examId);
+    // acquireLock trả về true khi Redis down (fallback) — DB lock bảo vệ thay thế
     const acquired = await this.redisService.acquireLock(lockKey, 120);
     if (!acquired) throw new SubmitConflictException();
 
     try {
       return await this._startAttempt(userId, dto);
     } finally {
+      // releaseLock không throw khi Redis down
       await this.redisService.releaseLock(lockKey);
     }
   }
@@ -226,15 +231,17 @@ export class AttemptService {
   async pingAttempt(userId: number, attemptId: number, deviceId: string) {
     const key = REDIS_KEYS.attemptSession(attemptId);
 
-    // Đọc từ Redis trước (cache-first)
+    // Đọc từ Redis trước (cache-first).
+    // getJson trả về null khi Redis down → tự động fallback DB bên dưới.
     let session = await this.redisService.getJson<AttemptSession>(key);
 
     if (!session) {
-      // Cache miss → fallback DB, warm cache
+      // Cache miss hoặc Redis down → fallback DB, warm cache (best-effort)
       const attempt = await this.attemptRepository.findOne({
         where: { id: attemptId, userId },
       });
       if (!attempt) throw new NotFoundException('Attempt not found');
+      // syncSession không throw khi Redis down
       await this.syncSession(attempt);
       session = {
         status: attempt.status,
@@ -311,7 +318,7 @@ export class AttemptService {
     dto: SubmitAttemptDto,
   ) {
     const lockKey = REDIS_KEYS.submitLock(attemptId);
-    // Cố gắng acquire submit lock trong 120 giây
+    // acquireLock trả về true khi Redis down — DB pessimistic lock bảo vệ thay thế
     const acquired = await this.redisService.acquireLock(lockKey, 120);
     if (!acquired) throw new SubmitConflictException();
 
@@ -465,7 +472,8 @@ export class AttemptService {
   // ─── Admin: Terminate attempt (cấm thi) ──────────────────────────────────
 
   async adminTerminateAttempt(attemptId: number) {
-    // Dùng submitLock để tránh race với user đang submit cùng lúc
+    // Dùng submitLock để tránh race với user đang submit cùng lúc.
+    // acquireLock trả về true khi Redis down — DB pessimistic lock bảo vệ thay thế.
     const lockKey = REDIS_KEYS.submitLock(attemptId);
     const acquired = await this.redisService.acquireLock(lockKey, 30);
     if (!acquired) throw new SubmitConflictException();
